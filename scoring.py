@@ -2,13 +2,76 @@ import sqlite3
 
 DB_PATH = "gifts.db"
 
+# Порядок бюджетов
+BUDGET_ORDER = ["budget_2000", "budget_5000", "budget_10000", "budget_15000",
+                "budget_20000", "budget_30000", "budget_50000", "budget_100000"]
 
-def has_tag(tags_string: str, tag: str) -> bool:
-    """Проверяет наличие тега в строке (точное совпадение, не подстрока)"""
-    if not tags_string:
-        return False
-    tags_list = [t.strip() for t in tags_string.split(',')]
-    return tag in tags_list
+
+def calculate_budget_score(user_max_budget: str, gift_budget_tags: str) -> float:
+    """
+    Рассчитывает баллы за соответствие бюджета.
+    
+    Логика:
+    - Если бюджет юзера попадает в нижнюю границу диапазона товара → штраф
+    - Если в середину → нейтрально
+    - Если в верхнюю границу → бонус
+    """
+    if not user_max_budget or not gift_budget_tags:
+        return 0.0
+    
+    # Индекс бюджета пользователя
+    if user_max_budget not in BUDGET_ORDER:
+        return 0.0
+    user_index = BUDGET_ORDER.index(user_max_budget)
+    
+    # Находим диапазон бюджета товара
+    gift_indices = []
+    for i, tag in enumerate(BUDGET_ORDER):
+        if tag in gift_budget_tags:
+            gift_indices.append(i)
+    
+    if not gift_indices:
+        return 0.0
+    
+    gift_min_index = min(gift_indices)
+    gift_max_index = max(gift_indices)
+    
+    # Если бюджет юзера ниже минимума товара — товар не подходит (отсеется фильтром)
+    if user_index < gift_min_index:
+        return -10.0
+    
+    # Если бюджет юзера выше максимума товара — товар дешевле чем юзер готов потратить
+    if user_index > gift_max_index:
+        # Чем больше разница, тем меньше баллов (слишком дёшево для бюджета)
+        diff = user_index - gift_max_index
+        if diff == 1:
+            return 0.5  # Немного дешевле — ок
+        elif diff == 2:
+            return 0.0  # Заметно дешевле — нейтрально
+        else:
+            return -0.5 * (diff - 2)  # Сильно дешевле — штраф
+    
+    # Бюджет юзера внутри диапазона товара
+    if gift_max_index == gift_min_index:
+        # Товар с одним бюджетом — точное попадание
+        return 2.0
+    
+    # Рассчитываем позицию в диапазоне (0 = нижняя граница, 1 = верхняя)
+    position = (user_index - gift_min_index) / (gift_max_index - gift_min_index)
+    
+    # Преобразуем позицию в баллы
+    # position = 0 → -1.0 балл (нижняя граница, товар скорее дороже)
+    # position = 0.5 → +0.5 балл (середина)
+    # position = 1 → +2.0 балла (верхняя граница, идеальное попадание)
+    
+    if position <= 0.25:
+        return -1.0  # Нижняя граница — штраф
+    elif position <= 0.5:
+        return 0.0   # Ниже середины — нейтрально
+    elif position <= 0.75:
+        return 1.0   # Выше середины — хорошо
+    else:
+        return 2.0   # Верхняя граница — отлично
 
 
 def filter_and_score_gifts(filters: dict, value_weights: dict, interest_weights: dict):
@@ -41,41 +104,39 @@ def filter_and_score_gifts(filters: dict, value_weights: dict, interest_weights:
         
         # Бюджет (хотя бы один тег должен совпасть)
         if 'budget' in filters:
-            budget_match = any(has_tag(budget_tags, b) for b in filters['budget'])
+            budget_match = any(b in budget_tags for b in filters['budget'])
             if not budget_match:
                 continue
         
         # Пол
         if 'gender' in filters:
-            if not has_tag(gender_tags, filters['gender']):
+            if filters['gender'] not in gender_tags:
                 continue
         
         # Возраст
         if 'age' in filters:
-            if not has_tag(age_tags, filters['age']):
+            if filters['age'] not in age_tags:
                 continue
         
         # Отношения
         if 'relationship' in filters:
-            if not has_tag(relationship_tags, filters['relationship']):
+            if filters['relationship'] not in relationship_tags:
                 continue
         
         # Повод
         if 'occasion' in filters:
-            if not has_tag(occasion_tags, filters['occasion']):
+            if filters['occasion'] not in occasion_tags:
                 continue
         
         # === ПАРСИМ ТЕГИ ПОДАРКА ===
         def get_tag_value(tags_str, tag_name):
             for part in tags_str.split(','):
                 part = part.strip()
-                if ':' in part:
-                    t_name, t_val = part.split(':', 1)
-                    if t_name.strip() == tag_name:
-                        try:
-                            return float(t_val)
-                        except:
-                            pass
+                if tag_name in part and ':' in part:
+                    try:
+                        return float(part.split(':')[1])
+                    except:
+                        pass
             return 0.0
         
         gift_practical = get_tag_value(value_tags, 'gift_practical')
@@ -95,6 +156,12 @@ def filter_and_score_gifts(filters: dict, value_weights: dict, interest_weights:
         
         # === SCORING ===
         score = 0.0
+        
+        # 0. БЮДЖЕТ — умный расчёт баллов
+        if 'budget' in filters and filters['budget']:
+            user_max_budget = filters['budget'][-1]  # Последний = максимальный
+            budget_score = calculate_budget_score(user_max_budget, budget_tags)
+            score += budget_score
         
         # 1. Практичный vs Эмоциональный
         user_practical = value_weights.get('gift_practical', 0.5)
@@ -170,30 +237,29 @@ def get_top_gifts(filters: dict, value_weights: dict, interest_weights: dict, li
 
 # === ТЕСТ ===
 if __name__ == "__main__":
-    print("ТЕСТ: Мужчина, до 2000₽, день рождения\n")
+    print("=" * 60)
+    print("ТЕСТ: Бюджет 10к — товары 10-50к должны быть ВНИЗУ")
+    print("=" * 60)
     
-    filters = {
-        'budget': ['budget_2000'],
-        'gender': 'gender_male',
-        'occasion': 'occasion_birthday'
-    }
+    # Товар с диапазоном 10к-50к
+    test_tags = "budget_10000, budget_15000, budget_20000, budget_30000, budget_50000"
     
-    value_weights = {
-        'gift_practical': 0.5,
-        'gift_emotional': 0.5,
-        'gift_experience': 0.5,
-        'gift_daily_use': 0.5,
-        'gift_aesthetic': 0.5,
-    }
+    print(f"\nТовар: {test_tags}")
+    print()
     
-    interest_weights = {}
+    for budget in BUDGET_ORDER:
+        score = calculate_budget_score(budget, test_tags)
+        print(f"Юзер {budget}: {score:+.1f} баллов")
     
-    top_gifts = get_top_gifts(filters, value_weights, interest_weights, limit=10)
+    print()
+    print("=" * 60)
+    print("ТЕСТ: Товар 2к-5к")
+    print("=" * 60)
     
-    print(f"Найдено подарков: {len(top_gifts)}\n")
+    test_tags2 = "budget_2000, budget_5000"
+    print(f"\nТовар: {test_tags2}")
+    print()
     
-    for i, gift in enumerate(top_gifts, 1):
-        print(f"{i}. {gift['name']}")
-        print(f"   💰 {gift['price']}")
-        print(f"   📊 Score: {gift['score']:.2f}")
-        print()
+    for budget in BUDGET_ORDER:
+        score = calculate_budget_score(budget, test_tags2)
+        print(f"Юзер {budget}: {score:+.1f} баллов")
