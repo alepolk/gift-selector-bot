@@ -1,14 +1,17 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from scoring import get_top_gifts
+from analytics import (
+    create_session, save_answers, save_rating, 
+    save_event, complete_session, get_collaborative_score
+)
 
 # === ТОКЕН БОТА ===
 BOT_TOKEN = "8513351241:AAGmH0ANaZqC-Iook7KJN0Vbo0qT8sKqgTU"
 
-# === ВОПРОСЫ (фиксированный порядок 1-9) ===
+# === ВОПРОСЫ ===
 QUESTIONS = [
     None,  # индекс 0 не используем
-    # 1. Бюджет
     {
         "text": "💰 Какой у вас бюджет на подарок?",
         "options": [
@@ -24,7 +27,6 @@ QUESTIONS = [
         "type": "primary",
         "tag": "budget"
     },
-    # 2. Пол
     {
         "text": "👤 Кому выбираете подарок?",
         "options": [
@@ -34,7 +36,6 @@ QUESTIONS = [
         "type": "primary",
         "tag": "gender"
     },
-    # 3. Возраст
     {
         "text": "🎂 Сколько лет получателю?",
         "options": [
@@ -49,7 +50,6 @@ QUESTIONS = [
         "type": "primary",
         "tag": "age"
     },
-    # 4. Отношения
     {
         "text": "👨‍👩‍👧 Кем вам приходится этот человек?",
         "options": [
@@ -65,7 +65,6 @@ QUESTIONS = [
         "type": "primary",
         "tag": "relationship"
     },
-    # 5. Повод
     {
         "text": "🎉 По какому поводу дарите?",
         "options": [
@@ -79,7 +78,6 @@ QUESTIONS = [
         "type": "primary",
         "tag": "occasion"
     },
-    # 6. Вещь или впечатление
     {
         "text": "🎁 Что лучше подарить?",
         "options": [
@@ -90,7 +88,6 @@ QUESTIONS = [
         "type": "value",
         "tag": "gift_experience"
     },
-    # 7. Практичный или эмоциональный
     {
         "text": "🎯 Какой подарок предпочтительнее?",
         "options": [
@@ -101,7 +98,6 @@ QUESTIONS = [
         "type": "value",
         "tag": "practical_emotional"
     },
-    # 8. Ежедневное использование
     {
         "text": "📅 Подарок для ежедневного использования?",
         "options": [
@@ -112,7 +108,6 @@ QUESTIONS = [
         "type": "value",
         "tag": "gift_daily_use"
     },
-    # 9. Эстетика
     {
         "text": "✨ Насколько важна красота подарка?",
         "options": [
@@ -125,7 +120,7 @@ QUESTIONS = [
     },
 ]
 
-# Увлечения для мужчин
+# Увлечения
 INTERESTS_MALE = [
     ("📱 Техника и гаджеты", "interest_tech"),
     ("⚽ Спорт и фитнес", "interest_sports"),
@@ -142,7 +137,6 @@ INTERESTS_MALE = [
     ("💼 Бизнес и карьера", "interest_business"),
 ]
 
-# Увлечения для женщин
 INTERESTS_FEMALE = [
     ("💄 Красота и уход", "interest_beauty"),
     ("👗 Мода и стиль", "interest_fashion"),
@@ -159,7 +153,6 @@ INTERESTS_FEMALE = [
     ("☕ Кофе и чай", "interest_coffee_tea"),
 ]
 
-# Увлечения для пожилых (65+)
 INTERESTS_ELDERLY = [
     ("🌻 Дача и сад", "interest_gardening"),
     ("💪 Здоровье и комфорт", "interest_health"),
@@ -176,7 +169,6 @@ user_data = {}
 
 
 def get_budget_tags(selected_budget: str) -> list:
-    """Возвращает список бюджетных тегов до выбранного включительно"""
     all_budgets = ["budget_2000", "budget_5000", "budget_10000", "budget_15000",
                    "budget_20000", "budget_30000", "budget_50000", "budget_100000"]
     if selected_budget in all_budgets:
@@ -186,18 +178,20 @@ def get_budget_tags(selected_budget: str) -> list:
 
 
 def get_interests_for_user(gender: str, age: str) -> list:
-    """Возвращает список увлечений в зависимости от пола и возраста"""
     if age == "age_65plus":
         return INTERESTS_ELDERLY
     if gender == "gender_female":
         return INTERESTS_FEMALE
-    else:
-        return INTERESTS_MALE
+    return INTERESTS_MALE
 
 
 def init_user_data(user_id: int):
-    """Инициализирует данные пользователя"""
+    # Создаём сессию аналитики
+    session_id = create_session(source="bot", user_id=str(user_id))
+    save_event(session_id, "start")
+    
     user_data[user_id] = {
+        "session_id": session_id,
         "current_question": 1,
         "filters": {},
         "value_weights": {
@@ -210,12 +204,13 @@ def init_user_data(user_id: int):
         "interest_weights": {},
         "selected_interests": [],
         "all_results": [],
-        "current_offset": 0
+        "current_gift_index": 0,
+        "liked_gifts": [],
+        "disliked_gifts": []
     }
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало опроса"""
     user_id = update.effective_user.id
     init_user_data(user_id)
 
@@ -230,115 +225,87 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Условия использования"""
     await update.message.reply_text(
         "📜 *Условия использования*\n\n"
-        "1. Бот предоставляет рекомендации подарков на основе ваших ответов.\n"
-        "2. Мы не гарантируем наличие товаров в магазинах.\n"
-        "3. Оплата за премиум-доступ не возвращается.\n"
-        "4. Используя бота, вы соглашаетесь с этими условиями.\n\n"
+        "1. Бот предоставляет рекомендации подарков.\n"
+        "2. Мы не гарантируем наличие товаров.\n"
+        "3. Используя бота, вы соглашаетесь с условиями.\n\n"
         "По вопросам: @cfc_consult",
         parse_mode="Markdown"
     )
 
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поддержка"""
     await update.message.reply_text(
         "🆘 *Поддержка*\n\n"
-        "Если у тебя возникли вопросы или проблемы, напиши: @cfc_consult\n\n"
+        "Вопросы или проблемы? Напиши: @cfc_consult\n\n"
         "Отвечаем в течение 24 часов.",
         parse_mode="Markdown"
     )
 
 
 async def paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поддержка по платежам"""
     await update.message.reply_text(
         "💳 *Поддержка по платежам*\n\n"
-        "Проблемы с оплатой? Напиши: @cfc_consult\n\n"
-        "Укажи:\n"
-        "• Дату и время платежа\n"
-        "• Сумму\n"
-        "• Описание проблемы\n\n"
-        "Разберёмся в течение 24 часов.",
+        "Проблемы с оплатой? Напиши: @cfc_consult",
         parse_mode="Markdown"
     )
 
 
 async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Отправляет вопрос пользователю"""
     q_num = user_data[user_id]["current_question"]
+    session_id = user_data[user_id]["session_id"]
 
-    # Вопрос 10 — увлечения (множественный выбор)
     if q_num == 10:
         await send_interests_question(update, context, user_id)
         return
 
-    # Вопросы закончились — показываем результат
     if q_num > 10:
-        await show_results(update, context, user_id)
+        await show_single_gift(update, context, user_id)
         return
 
-    # Вопросы 1-9
     question = QUESTIONS[q_num]
+    
+    # Сохраняем событие
+    save_event(session_id, f"question_{q_num}")
 
-    # Создаём кнопки
     keyboard = []
     for text, value in question["options"]:
         keyboard.append([InlineKeyboardButton(text, callback_data=f"q{q_num}_{value}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     text = f"*Вопрос {q_num} из 10*\n\n{question['text']}"
 
-    # Если это callback (ответ на кнопку) — редактируем сообщение
     if update.callback_query:
         try:
-            await update.callback_query.message.edit_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         except:
-            await update.callback_query.message.reply_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await update.callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def send_interests_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Отправляет вопрос про увлечения с множественным выбором"""
     data = user_data[user_id]
     gender = data["filters"].get("gender", "gender_male")
     age = data["filters"].get("age", "age_26_35")
+    session_id = data["session_id"]
+    
+    # Сохраняем событие только при первом показе
+    if data["current_question"] == 10:
+        save_event(session_id, "question_10_interests")
+        user_data[user_id]["current_question"] = 10.5  # Помечаем что уже показали
 
     interests = get_interests_for_user(gender, age)
     selected = data.get("selected_interests", [])
 
-    # Создаём кнопки с галочками
     keyboard = []
     for text, tag in interests:
         checkmark = "✅ " if tag in selected else ""
-        keyboard.append([InlineKeyboardButton(
-            f"{checkmark}{text}",
-            callback_data=f"interest_{tag}"
-        )])
+        keyboard.append([InlineKeyboardButton(f"{checkmark}{text}", callback_data=f"interest_{tag}")])
 
-    # Кнопка "Не знаю увлечений"
-    keyboard.append([InlineKeyboardButton(
-        "🤷 Не знаю увлечений",
-        callback_data="interest_none"
-    )])
-
-    # Кнопка "Готово"
-    keyboard.append([InlineKeyboardButton(
-        "✅ Готово — показать подарки",
-        callback_data="interests_done"
-    )])
+    keyboard.append([InlineKeyboardButton("🤷 Не знаю увлечений", callback_data="interest_none")])
+    keyboard.append([InlineKeyboardButton("✅ Готово — показать подарки", callback_data="interests_done")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -351,62 +318,191 @@ async def send_interests_question(update: Update, context: ContextTypes.DEFAULT_
 
     if update.callback_query:
         try:
-            await update.callback_query.message.edit_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            # Проверяем изменился ли текст
+            current_text = update.callback_query.message.text
+            if current_text != text or True:  # Всегда обновляем для кнопок
+                await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception as e:
+            # Игнорируем ошибку "message is not modified"
+            if "message is not modified" not in str(e):
+                await update.callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def show_single_gift(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Показывает один подарок с кнопками лайк/дизлайк"""
+    data = user_data[user_id]
+    session_id = data["session_id"]
+    
+    # Если результаты ещё не загружены
+    if not data["all_results"]:
+        all_gifts = get_top_gifts(
+            filters=data["filters"],
+            value_weights=data["value_weights"],
+            interest_weights=data["interest_weights"],
+            limit=100
+        )
+        user_data[user_id]["all_results"] = all_gifts
+        
+        # Сохраняем ответы в аналитику
+        save_answers(
+            session_id=session_id,
+            filters=data["filters"],
+            value_weights=data["value_weights"],
+            interests=data["selected_interests"]
+        )
+        save_event(session_id, "results_loaded", {"count": len(all_gifts)})
+
+    all_gifts = data["all_results"]
+    current_index = data["current_gift_index"]
+
+    # Если подарки закончились
+    if current_index >= len(all_gifts):
+        await show_summary(update, context, user_id)
+        return
+
+    gift = all_gifts[current_index]
+    total = len(all_gifts)
+
+    # Формируем текст
+    text = f"🎁 *Подарок {current_index + 1} из {total}*\n\n"
+    text += f"*{gift['name']}*\n"
+    text += f"💰 {gift['price']}\n\n"
+    if gift['description']:
+        text += f"📝 {gift['description']}\n\n"
+    text += "_Оцени подарок — покажем следующий!_"
+
+    # Кнопки
+    keyboard = [
+        [
+            InlineKeyboardButton("👍 Нравится", callback_data=f"rate_like_{gift['id']}"),
+            InlineKeyboardButton("👎 Не подходит", callback_data=f"rate_dislike_{gift['id']}")
+        ],
+        [InlineKeyboardButton("⏭️ Пропустить", callback_data="rate_skip")],
+        [InlineKeyboardButton("🏁 Завершить подбор", callback_data="rate_finish")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         except:
-            await update.callback_query.message.reply_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await update.callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Показывает итоги подбора"""
+    data = user_data[user_id]
+    session_id = data["session_id"]
+    
+    liked = data["liked_gifts"]
+    total_viewed = data["current_gift_index"]
+    
+    complete_session(session_id)
+    save_event(session_id, "completed", {"liked": len(liked), "viewed": total_viewed})
+
+    text = "🎉 *Подбор завершён!*\n\n"
+    text += f"📊 Просмотрено: {total_viewed} подарков\n"
+    text += f"❤️ Понравилось: {len(liked)}\n\n"
+
+    if liked:
+        text += "*Твои избранные:*\n\n"
+        for i, gift in enumerate(liked[:10], 1):
+            text += f"{i}. {gift['name']} — {gift['price']}\n"
+
+    text += "\n🔄 Хочешь начать заново? Нажми /start"
+
+    keyboard = [[InlineKeyboardButton("🔄 Начать заново", callback_data="restart")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ответ пользователя"""
     query = update.callback_query
-
+    
     try:
         await query.answer()
-    except Exception:
+    except:
         pass
 
     user_id = update.effective_user.id
     data_str = query.data
 
-    # Проверяем есть ли пользователь
     if user_id not in user_data:
         init_user_data(user_id)
         await query.message.reply_text("⚠️ Сессия устарела. Начинаем заново!\n\nНажми /start")
         return
 
-    # Обработка кнопки "Показать ещё"
-    if data_str.startswith("more_"):
-        offset = int(data_str.split("_")[1])
-        await show_results(update, context, user_id, offset)
-        return
+    data = user_data[user_id]
+    session_id = data["session_id"]
 
-    # Обработка кнопки "Начать заново"
+    # === ОБРАБОТКА ОЦЕНОК ===
+    if data_str.startswith("rate_"):
+        action = data_str.replace("rate_", "")
+        
+        if action == "skip":
+            save_event(session_id, "skip", {"index": data["current_gift_index"]})
+            user_data[user_id]["current_gift_index"] += 1
+            await show_single_gift(update, context, user_id)
+            return
+        
+        if action == "finish":
+            await show_summary(update, context, user_id)
+            return
+        
+        if action.startswith("like_"):
+            gift_id = int(action.replace("like_", ""))
+            gift = data["all_results"][data["current_gift_index"]]
+            
+            save_rating(session_id, gift_id, gift["name"], rating=1)
+            save_event(session_id, "like", {"gift_id": gift_id})
+            
+            user_data[user_id]["liked_gifts"].append(gift)
+            user_data[user_id]["current_gift_index"] += 1
+            await show_single_gift(update, context, user_id)
+            return
+        
+        if action.startswith("dislike_"):
+            gift_id = int(action.replace("dislike_", ""))
+            gift = data["all_results"][data["current_gift_index"]]
+            
+            save_rating(session_id, gift_id, gift["name"], rating=-1)
+            save_event(session_id, "dislike", {"gift_id": gift_id})
+            
+            user_data[user_id]["disliked_gifts"].append(gift)
+            user_data[user_id]["current_gift_index"] += 1
+            await show_single_gift(update, context, user_id)
+            return
+
+    # === RESTART ===
     if data_str == "restart":
         init_user_data(user_id)
         await send_question(update, context, user_id)
         return
 
-    # Обработка выбора увлечений
+    # === ИНТЕРЕСЫ ===
     if data_str.startswith("interest_"):
         interest_tag = data_str.replace("interest_", "")
 
         if interest_tag == "none":
             user_data[user_id]["selected_interests"] = []
+            user_data[user_id]["interest_weights"] = {}
             user_data[user_id]["current_question"] = 11
-            await show_results(update, context, user_id)
+            await show_single_gift(update, context, user_id)
             return
 
-        # Переключаем выбор увлечения
+        # Защита от двойных нажатий
+        if "processing_interest" in data and data["processing_interest"]:
+            return
+        user_data[user_id]["processing_interest"] = True
+
         selected = user_data[user_id].get("selected_interests", [])
         if interest_tag in selected:
             selected.remove(interest_tag)
@@ -415,19 +511,11 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data[user_id]["selected_interests"] = selected
 
         await send_interests_question(update, context, user_id)
+        
+        user_data[user_id]["processing_interest"] = False
         return
 
-    # Обработка "Готово" по увлечениям
-    if data_str == "interests_done":
-        selected = user_data[user_id].get("selected_interests", [])
-        for tag in selected:
-            user_data[user_id]["interest_weights"][tag] = 1.0
-
-        user_data[user_id]["current_question"] = 11
-        await show_results(update, context, user_id)
-        return
-
-    # Обработка ответов на вопросы 1-9
+    # === ВОПРОСЫ 1-9 ===
     if data_str.startswith("q"):
         parts = data_str.split("_", 1)
         q_num = int(parts[0].replace("q", ""))
@@ -435,14 +523,12 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         question = QUESTIONS[q_num]
 
-        # PRIMARY вопросы
         if question["type"] == "primary":
             if question["tag"] == "budget":
                 user_data[user_id]["filters"]["budget"] = get_budget_tags(answer)
             else:
                 user_data[user_id]["filters"][question["tag"]] = answer
 
-        # VALUE вопросы
         elif question["type"] == "value":
             if question["tag"] == "gift_experience":
                 val = float(answer.split("_")[1])
@@ -467,66 +553,11 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 val = float(answer.split("_")[1])
                 user_data[user_id]["value_weights"]["gift_aesthetic"] = val
 
-        # Следующий вопрос
         user_data[user_id]["current_question"] = q_num + 1
         await send_question(update, context, user_id)
 
 
-async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, offset: int = 0):
-    """Показывает результаты подбора"""
-    data = user_data[user_id]
-
-    if offset == 0:
-        all_gifts = get_top_gifts(
-            filters=data["filters"],
-            value_weights=data["value_weights"],
-            interest_weights=data["interest_weights"],
-            limit=100
-        )
-        user_data[user_id]["all_results"] = all_gifts
-    else:
-        all_gifts = user_data[user_id]["all_results"]
-
-    if not all_gifts:
-        await update.callback_query.message.reply_text(
-            "😔 К сожалению, не нашлось подходящих подарков.\n\n"
-            "Попробуй изменить параметры: /start"
-        )
-        return
-
-    user_data[user_id]["current_offset"] = offset
-
-    gifts_to_show = all_gifts[offset:offset + 5]
-
-    if not gifts_to_show:
-        await update.callback_query.message.reply_text(
-            "📭 Больше подходящих подарков нет.\n\n🔄 Начать заново: /start"
-        )
-        return
-
-    text = f"🎁 *ПОДАРКИ {offset + 1}–{offset + len(gifts_to_show)} из {len(all_gifts)}:*\n\n"
-
-    for i, gift in enumerate(gifts_to_show, offset + 1):
-        text += f"*{i}. {gift['name']}*\n"
-        text += f"💰 {gift['price']}\n"
-        if gift['description']:
-            text += f"📝 {gift['description']}\n"
-        text += "\n"
-
-    keyboard = []
-
-    if offset + 5 < len(all_gifts):
-        keyboard.append([InlineKeyboardButton("➡️ Показать ещё 5", callback_data=f"more_{offset + 5}")])
-
-    keyboard.append([InlineKeyboardButton("🔄 Начать заново", callback_data="restart")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.callback_query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-
-
 def main():
-    """Запуск бота"""
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -535,7 +566,7 @@ def main():
     app.add_handler(CommandHandler("paysupport", paysupport))
     app.add_handler(CallbackQueryHandler(handle_answer))
 
-    print("🤖 Бот запущен! (v2.3 - с командами поддержки)")
+    print("🤖 Бот запущен! (v3.0 - с аналитикой и лайками)")
     app.run_polling()
 
 
